@@ -114,37 +114,61 @@ export async function createCustomerPortalSession(team: Team) {
   });
 }
 
+import { stripe } from './stripe'
+import { db } from '@/lib/db/drizzle'
+import { subscriptions } from '@/lib/db/schema'
+import { eq } from 'drizzle-orm'
+
 export async function handleSubscriptionChange(
   subscription: Stripe.Subscription
 ) {
-  const customerId = subscription.customer as string;
-  const subscriptionId = subscription.id;
-  const status = subscription.status;
+  try {
+    const customerId = subscription.customer as string
+    const subscriptionId = subscription.id
+    const status = subscription.status
+    const eventTimestamp = new Date(subscription.created * 1000).toISOString()
 
-  const team = await getTeamByStripeCustomerId(customerId);
+    const customerEmail =
+      (subscription.customer_email as string) ||
+      subscription.metadata?.email ||
+      null
 
-  if (!team) {
-    console.error('Team not found for Stripe customer:', customerId);
-    return;
-  }
+    // Se já existir, atualiza; se não existir, insere
+    const existing = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripe_event_id, subscriptionId))
+      .limit(1)
 
-  if (status === 'active' || status === 'trialing') {
-    const plan = subscription.items.data[0]?.plan;
-    await updateTeamSubscription(team.id, {
-      stripeSubscriptionId: subscriptionId,
-      stripeProductId: plan?.product as string,
-      planName: (plan?.product as Stripe.Product).name,
-      subscriptionStatus: status
-    });
-  } else if (status === 'canceled' || status === 'unpaid') {
-    await updateTeamSubscription(team.id, {
-      stripeSubscriptionId: null,
-      stripeProductId: null,
-      planName: null,
-      subscriptionStatus: status
-    });
+    if (existing.length > 0) {
+      await db
+        .update(subscriptions)
+        .set({
+          status,
+          customer_email: customerEmail,
+          event_timestamp: eventTimestamp,
+          payload: subscription as any,
+          updated_at: new Date()
+        })
+        .where(eq(subscriptions.stripe_event_id, subscriptionId))
+    } else {
+      await db.insert(subscriptions).values({
+        stripe_event_id: subscriptionId,
+        event_type: 'customer.subscription.updated',
+        status,
+        customer_email: customerEmail,
+        event_timestamp: eventTimestamp,
+        payload: subscription as any,
+        created_at: new Date()
+      })
+    }
+
+    console.log('✅ Subscription gravada/atualizada com sucesso.')
+  } catch (err) {
+    console.error('❌ Erro ao salvar assinatura na Supabase:', err)
   }
 }
+
 
 export async function getStripePrices() {
   const prices = await stripe.prices.list({
